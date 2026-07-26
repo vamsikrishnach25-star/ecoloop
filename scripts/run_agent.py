@@ -49,13 +49,13 @@ def run_with_agent(baseline_kwh: float):
         _state["baseline_kwh"] = baseline_kwh
         _state["current_policy"] = Policy(
             cooling_offset=0.0,
-            unocc_cooling_offset=0.5,
+            unocc_cooling_offset=0.8,
             unocc_heating_offset=-0.5,
             precool_hours=2.0,
-            precool_depth=0.5,
+            precool_depth=0.6,
             peak_start=17,
             peak_end=21,
-            peak_offset=0.5,
+            peak_offset=0.4,
             reason="initial policy: unoccupied setback + precool before evening peak",
         )
 

@@ -18,7 +18,7 @@ from .mcp_server import (
     set_control_policy, get_current_policy, _state, _lock,
 )
 
-AGENT_INTERVAL_SIM_HOURS = 2.0
+AGENT_INTERVAL_SIM_HOURS = 0.5
 
 PREFERRED_MODELS = [
     "qwen2.5:1.5b-instruct",
