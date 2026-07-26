@@ -1,3 +1,4 @@
+import os
 """The closed loop itself.
 
 This is the file that makes the project what it claims to be. The LLM agent runs
@@ -287,3 +288,4 @@ class EcoLoopRunner:
             "kgco2": carbon,
             "decisions": len(self.decisions),
         }
+
