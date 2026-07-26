@@ -1,44 +1,27 @@
-"""The LLM agent — the brain of Eco-Loop.
+"""LLM agent — works reliably with small models (1.5b+).
 
-Runs on a background thread, completely decoupled from the EnergyPlus simulation.
-Every AGENT_INTERVAL simulated hours it:
-  1. Calls get_telemetry() to read current building state
-  2. Calls get_savings_so_far() to check progress
-  3. Calls get_carbon_intensity() to see the grid
-  4. Reasons about what policy to set
-  5. Calls set_control_policy() with its decision
-  6. If rejected: reads the error, corrects, retries once (self-correction loop)
-
-The agent never blocks the simulation. If inference takes longer than the interval,
-the last good policy keeps running. If the model returns garbage, the validator
-rejects it and the last good policy keeps running. The simulation cannot stall.
-
-Model: Qwen2.5-7B-Instruct via Ollama (best small-model tool calling as of 2025).
-Fallback: any model Ollama has available.
+Instead of complex tool-calling chains (which need 7b+ models), this agent:
+1. Gathers telemetry directly from shared state
+2. Builds a rich context prompt
+3. Asks the LLM for a JSON policy decision
+4. Validates and applies the policy
+5. Retries with error feedback if rejected (self-correction loop)
 """
 
 import json
 import threading
 import time
-from typing import Any
 
 from . import config as C
 from .mcp_server import (
-    get_telemetry,
-    get_savings_so_far,
-    get_carbon_intensity,
-    set_control_policy,
-    _state,
-    _lock,
+    get_telemetry, get_savings_so_far, get_carbon_intensity,
+    set_control_policy, get_current_policy, _state, _lock,
 )
 
-# How often the agent wakes up, in simulated hours.
-# At 4 timesteps/hour a 2-hour interval = 8 timesteps between LLM calls.
-# Adjust down if you want more frequent decisions for the demo video.
 AGENT_INTERVAL_SIM_HOURS = 2.0
 
-# Preferred models in order. First one Ollama has installed wins.
 PREFERRED_MODELS = [
+    "qwen2.5:1.5b-instruct",
     "qwen2.5:7b-instruct",
     "qwen2.5:3b-instruct",
     "llama3.1:8b",
@@ -46,206 +29,147 @@ PREFERRED_MODELS = [
     "mistral:7b",
 ]
 
-SYSTEM_PROMPT = """You are an expert building energy management AI controlling a real
-office building through EnergyPlus simulation. Your goal is to minimize energy
-consumption and carbon emissions while keeping occupant thermal comfort within
-the ASHRAE 55 standard (PMV between -0.5 and +0.5 during occupied hours).
+POLICY_PROMPT = """You are an AI building energy manager. Based on the sensor data below,
+output a JSON control policy to minimize energy and carbon while keeping PMV in [-0.5, +0.5]
+during occupied hours (07:00-19:00).
 
-You have five tools available:
-- get_telemetry: read current building sensor data
-- get_savings_so_far: check energy and comfort performance vs baseline
-- get_carbon_intensity: see the grid carbon profile by hour
-- set_control_policy: update the building control strategy
-- get_simulation_errors: check for any building model warnings
+CURRENT BUILDING STATE:
+{telemetry}
 
-STRATEGY PRINCIPLES:
-1. Occupied hours (07:00-19:00): keep PMV in [-0.5, +0.5]. Cooling offset max 0.5 degC.
-2. Unoccupied hours: be aggressive. 1-3 degC setback is fine, nobody is there.
-3. Precool before the dirty evening peak (17:00-21:00) using cheap clean midday electricity.
-4. Carbon savings can exceed energy savings when you shift load from dirty to clean hours.
-5. Watch the fan energy penalty — deep night setback causes morning pull-down spikes.
-   Gradual recovery (small offsets) avoids this.
-6. If set_control_policy is REJECTED, read the error, fix the value, retry immediately.
+SAVINGS SO FAR:
+{savings}
 
-Always call get_telemetry first, then reason, then act. Explain your reasoning in
-the `reason` field of set_control_policy — this appears on the dashboard.
-"""
+CARBON NOW:
+{carbon}
+
+OUTPUT RULES:
+- Return ONLY a valid JSON object, no text outside the JSON
+- Use the "reason" field to explain your strategy in one sentence
+- During occupied hours (07-19): cooling_offset max 0.5
+- During unoccupied hours: unocc_cooling_offset can be 0.5-2.0
+- If carbon > 700: use peak_offset to reduce peak load
+- If carbon < 600: use precool to store cheap clean energy
+
+EXAMPLE:
+{{
+  "cooling_offset": 0.2,
+  "heating_offset": 0.0,
+  "unocc_cooling_offset": 1.0,
+  "unocc_heating_offset": -0.5,
+  "precool_hours": 2.0,
+  "precool_depth": 0.8,
+  "peak_start": 17,
+  "peak_end": 21,
+  "peak_offset": 0.5,
+  "reason": "Carbon high at peak, precooling with clean midday electricity"
+}}
+
+YOUR JSON POLICY:"""
 
 
-def _pick_model() -> str | None:
-    """Return the first preferred model Ollama has available."""
+def _pick_model():
     try:
         import ollama
-        available = {m.model.split(":")[0] for m in ollama.list().models}
+        available = {m.model for m in ollama.list().models}
         for m in PREFERRED_MODELS:
-            if m.split(":")[0] in available:
+            if m in available:
                 return m
-        # Fall back to whatever is installed
-        models = ollama.list().models
-        if models:
-            return models[0].model
+        for m in PREFERRED_MODELS:
+            for a in available:
+                if a.startswith(m.split(":")[0]):
+                    return a
+        if available:
+            return list(available)[0]
     except Exception:
         pass
     return None
 
 
-def _run_agent_turn(model: str, sim_hour: float, sim_day: int, verbose: bool):
-    """One agent decision cycle. Returns the policy dict or None on failure."""
+def _ask_llm(model, prompt):
     import ollama
+    try:
+        response = ollama.chat(
+            model=model,
+            messages=[{"role": "user", "content": prompt}],
+            options={"temperature": 0.1},
+        )
+        text = response.message.content.strip()
+        start = text.find("{")
+        end = text.rfind("}") + 1
+        if start >= 0 and end > start:
+            return json.loads(text[start:end])
+    except Exception:
+        pass
+    return None
 
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
 
-    # Initial prompt — what the agent sees at the start of its turn
-    messages.append({"role": "user", "content": (
-        f"It is simulated day {sim_day}, hour {sim_hour % 24:.1f}. "
-        "Please check the building state, review the carbon profile, assess our "
-        "savings so far, then set an optimal control policy. "
-        "Explain your reasoning clearly in the reason field."
-    )})
+def _run_agent_turn(model, sim_hour, sim_day, verbose):
+    telemetry = get_telemetry(window_hours=2.0)
+    savings = get_savings_so_far()
+    carbon = get_carbon_intensity(hour_of_day=int(sim_hour) % 24)
 
-    tools = [
-        {
-            "type": "function",
-            "function": {
-                "name": "get_telemetry",
-                "description": "Get recent building sensor readings summary",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "window_hours": {
-                            "type": "number",
-                            "description": "Hours of history to summarise (default 2)"
-                        }
-                    },
-                },
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "get_savings_so_far",
-                "description": "Get energy and carbon savings vs baseline",
-                "parameters": {"type": "object", "properties": {}},
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "get_carbon_intensity",
-                "description": "Get grid carbon intensity by hour of day",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "hour_of_day": {
-                            "type": "integer",
-                            "description": "0-23 for a specific hour, -1 for full profile"
-                        }
-                    },
-                },
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "set_control_policy",
-                "description": "Set the building control policy",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "cooling_offset": {"type": "number"},
-                        "heating_offset": {"type": "number"},
-                        "unocc_cooling_offset": {"type": "number"},
-                        "unocc_heating_offset": {"type": "number"},
-                        "precool_hours": {"type": "number"},
-                        "precool_depth": {"type": "number"},
-                        "peak_start": {"type": "integer"},
-                        "peak_end": {"type": "integer"},
-                        "peak_offset": {"type": "number"},
-                        "reason": {"type": "string"},
-                    },
-                    "required": ["reason"],
-                },
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "get_simulation_errors",
-                "description": "Check for EnergyPlus warnings or errors",
-                "parameters": {"type": "object", "properties": {}},
-            },
-        },
-    ]
+    prompt = POLICY_PROMPT.format(
+        telemetry=telemetry, savings=savings, carbon=carbon)
 
-    # Tool dispatch map
-    tool_map = {
-        "get_telemetry": lambda args: get_telemetry(**args),
-        "get_savings_so_far": lambda args: get_savings_so_far(),
-        "get_carbon_intensity": lambda args: get_carbon_intensity(**args),
-        "set_control_policy": lambda args: set_control_policy(**args),
-        "get_simulation_errors": lambda args: get_simulation_errors(),
-    }
+    if verbose:
+        print(f"  [agent] asking {model} for policy...")
 
-    MAX_TURNS = 8  # prevent infinite loops
-    policy_set = False
+    raw = _ask_llm(model, prompt)
+    if raw is None:
+        if verbose:
+            print("  [agent] no valid JSON returned, keeping current policy")
+        return False
 
-    for turn in range(MAX_TURNS):
-        try:
-            response = ollama.chat(
-                model=model,
-                messages=messages,
-                tools=tools,
-                options={"temperature": 0.2},  # low temp = more deterministic policy
+    if verbose:
+        print(f"  [agent] proposed: {raw.get('reason','')[:80]}")
+
+    result_str = set_control_policy(
+        cooling_offset=float(raw.get("cooling_offset", 0)),
+        heating_offset=float(raw.get("heating_offset", 0)),
+        unocc_cooling_offset=float(raw.get("unocc_cooling_offset", 0)),
+        unocc_heating_offset=float(raw.get("unocc_heating_offset", 0)),
+        precool_hours=float(raw.get("precool_hours", 0)),
+        precool_depth=float(raw.get("precool_depth", 0)),
+        peak_start=int(raw.get("peak_start", 17)),
+        peak_end=int(raw.get("peak_end", 21)),
+        peak_offset=float(raw.get("peak_offset", 0)),
+        reason=str(raw.get("reason", "LLM policy")),
+    )
+    result = json.loads(result_str)
+
+    if result["status"] == "REJECTED":
+        if verbose:
+            print(f"  [agent] REJECTED: {result['reason']}")
+        # Self-correction: retry with error context
+        retry_prompt = (prompt +
+            f"\n\nREJECTED: {result['reason']}\nFix and output corrected JSON:")
+        raw2 = _ask_llm(model, retry_prompt)
+        if raw2:
+            r2 = set_control_policy(
+                cooling_offset=float(raw2.get("cooling_offset", 0)),
+                heating_offset=float(raw2.get("heating_offset", 0)),
+                unocc_cooling_offset=float(raw2.get("unocc_cooling_offset", 0)),
+                unocc_heating_offset=float(raw2.get("unocc_heating_offset", 0)),
+                precool_hours=float(raw2.get("precool_hours", 0)),
+                precool_depth=float(raw2.get("precool_depth", 0)),
+                peak_start=int(raw2.get("peak_start", 17)),
+                peak_end=int(raw2.get("peak_end", 21)),
+                peak_offset=float(raw2.get("peak_offset", 0)),
+                reason=str(raw2.get("reason", "corrected policy")),
             )
-        except Exception as e:
+            r2d = json.loads(r2)
             if verbose:
-                print(f"  [agent] ollama error: {e}")
-            return None
+                print(f"  [agent] retry {r2d['status']}")
+            return r2d["status"] == "ACCEPTED"
+        return False
 
-        msg = response.message
-        messages.append({"role": "assistant", "content": msg.content or "",
-                         "tool_calls": [tc.model_dump() for tc in (msg.tool_calls or [])]})
-
-        if not msg.tool_calls:
-            # Model finished without calling set_control_policy
-            if verbose:
-                print(f"  [agent] finished after {turn+1} turns, policy_set={policy_set}")
-            break
-
-        for tc in msg.tool_calls:
-            name = tc.function.name
-            args = tc.function.arguments or {}
-            if isinstance(args, str):
-                try:
-                    args = json.loads(args)
-                except json.JSONDecodeError:
-                    args = {}
-
-            if verbose:
-                print(f"  [agent] -> {name}({list(args.keys())})")
-
-            fn = tool_map.get(name)
-            result = fn(args) if fn else json.dumps({"error": f"Unknown tool: {name}"})
-
-            if verbose and name == "set_control_policy":
-                r = json.loads(result)
-                print(f"  [agent] policy {r['status']}: {args.get('reason','')[:80]}")
-                if r["status"] == "ACCEPTED":
-                    policy_set = True
-
-            messages.append({
-                "role": "tool",
-                "content": result,
-                "name": name,
-            })
-
-    return policy_set
+    if verbose:
+        print(f"  [agent] ACCEPTED ✓")
+    return True
 
 
 class EcoAgent:
-    """Background agent thread. Instantiate, call start(), then run the simulation."""
-
-    def __init__(self, baseline_kwh: float, verbose: bool = True):
+    def __init__(self, baseline_kwh, verbose=True):
         self.baseline_kwh = baseline_kwh
         self.verbose = verbose
         self.model = None
@@ -254,28 +178,21 @@ class EcoAgent:
         self._last_sim_hour = -999.0
 
     def start(self):
-        """Find the model and launch the background thread."""
         self.model = _pick_model()
         if self.model is None:
-            print("  [agent] WARNING: no Ollama model found. "
-                  "Run `ollama pull qwen2.5:7b-instruct` then restart.")
+            print("  [agent] WARNING: no Ollama model found.")
             return
-
         print(f"  [agent] using model: {self.model}")
-        # Push the baseline so get_savings_so_far has a denominator
         with _lock:
             _state["baseline_kwh"] = self.baseline_kwh
-
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
 
     def stop(self):
         self._stop.set()
 
-    def notify_timestep(self, sim_hour: float, sim_day: int,
-                        telemetry_row: dict, kwh_total: float,
-                        peak_kw: float, pmv_compliance: float):
-        """Called by the runner every timestep to push fresh state in."""
+    def notify_timestep(self, sim_hour, sim_day, telemetry_row,
+                        kwh_total, peak_kw, pmv_compliance):
         with _lock:
             _state["sim_hour"] = sim_hour
             _state["sim_day"] = sim_day
@@ -283,29 +200,22 @@ class EcoAgent:
             _state["current_peak_kw"] = peak_kw
             _state["current_pmv_compliance"] = pmv_compliance
             _state["telemetry"].append(telemetry_row)
-            # Keep a rolling 24-hour window (96 timesteps at 4/hr)
             if len(_state["telemetry"]) > 96:
                 _state["telemetry"] = _state["telemetry"][-96:]
 
     def _loop(self):
-        """Agent loop: wake every AGENT_INTERVAL sim hours, run one decision cycle."""
         while not self._stop.is_set():
             with _lock:
                 sim_hour = _state["sim_hour"]
                 sim_day = _state["sim_day"]
-
-            # Wait until enough simulated time has passed
             if sim_hour - self._last_sim_hour < AGENT_INTERVAL_SIM_HOURS:
                 time.sleep(0.5)
                 continue
-
             self._last_sim_hour = sim_hour
             if self.verbose:
                 print(f"\n  [agent] waking: day {sim_day} hour {sim_hour % 24:.1f}")
-
             try:
                 _run_agent_turn(self.model, sim_hour, sim_day, self.verbose)
             except Exception as e:
                 if self.verbose:
-                    print(f"  [agent] error in turn: {e}")
-                # Last good policy keeps running — no crash, no stall
+                    print(f"  [agent] error: {e}")

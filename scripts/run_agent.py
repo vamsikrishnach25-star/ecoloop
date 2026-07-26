@@ -1,19 +1,6 @@
-"""Run the full Eco-Loop: EnergyPlus simulation + live LLM agent.
+"""Run the full Eco-Loop: EnergyPlus + live LLM agent.
 
-This is the script to show in your demo video.
-
-Usage:
-    # 1. Make sure Ollama is running:  ollama serve
-    # 2. Pull a model:                 ollama pull qwen2.5:7b-instruct
-    # 3. Run:
     python scripts/run_agent.py
-
-What it does:
-    - Runs baseline first (no agent) to get the denominator
-    - Then runs agent mode: EnergyPlus + LLM agent on a background thread
-    - Agent reads telemetry every 2 simulated hours and issues control policies
-    - Prints a live comparison table at the end
-    - Saves timeseries.csv and decisions.json for the dashboard
 """
 
 import json
@@ -24,7 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from ecoloop import config as C
 from ecoloop.agent import EcoAgent
-from ecoloop.mcp_server import update_state
+from ecoloop.mcp_server import update_state, get_current_policy
 from ecoloop.policy import Policy
 from ecoloop.runner import EcoLoopRunner
 
@@ -53,21 +40,37 @@ def run_with_agent(baseline_kwh: float):
     print("="*60)
 
     agent = EcoAgent(baseline_kwh=baseline_kwh, verbose=True)
+
+    # IMPORTANT: Pre-seed with a known-good policy so the simulation
+    # gets real agent control even before the first LLM response arrives.
+    # The LLM then refines this every 2 simulated hours.
+    from ecoloop.mcp_server import _state, _lock
+    with _lock:
+        _state["baseline_kwh"] = baseline_kwh
+        _state["current_policy"] = Policy(
+            cooling_offset=0.0,
+            unocc_cooling_offset=0.5,
+            unocc_heating_offset=-0.5,
+            precool_hours=2.0,
+            precool_depth=0.5,
+            peak_start=17,
+            peak_end=21,
+            peak_offset=0.5,
+            reason="initial policy: unoccupied setback + precool before evening peak",
+        )
+
     agent.start()
 
-    # Patch the runner to feed the agent every timestep
     out_dir = C.RESULTS / "agent"
     runner = EcoLoopRunner(
         idf=C.IDF, epw=C.EPW,
         out_dir=out_dir,
         mode="agent",
-        policy_provider=lambda: agent.model and
-            __import__('ecoloop.mcp_server', fromlist=['get_current_policy'])
-            .get_current_policy() or Policy(),
+        policy_provider=get_current_policy,
         verbose=True,
     )
 
-    # Hook into the runner's report callback to feed the agent
+    # Hook into runner to feed agent every timestep
     original_report = runner._on_report
     def patched_report(state):
         original_report(state)
@@ -102,7 +105,6 @@ def run_with_agent(baseline_kwh: float):
     (out_dir / "summary.json").write_text(json.dumps(summary, indent=2))
     (out_dir / "decisions.json").write_text(
         json.dumps(runner.decisions, indent=2))
-
     return summary
 
 
@@ -134,29 +136,23 @@ def print_table(base, agent_s):
     if comfort_ok:
         print("\n  ✓ Comfort maintained. Energy savings are valid.")
     else:
-        print("\n  ✗ Comfort degraded. Try a more conservative policy.")
+        print("\n  ✗ Comfort degraded vs baseline.")
     print()
 
 
 def main():
-    # Check Ollama is reachable before starting a 20-minute simulation
     try:
         import ollama
         models = ollama.list().models
-        if not models:
-            print("\nWARNING: Ollama has no models installed.")
-            print("Run:  ollama pull qwen2.5:7b-instruct")
-            print("Then: ollama serve  (in a separate terminal)")
-            print("\nContinuing anyway — agent will use last-good policy fallback.\n")
-        else:
+        if models:
             print(f"  Ollama ready. Models: {[m.model for m in models]}")
+        else:
+            print("  WARNING: No Ollama models. Run: ollama pull qwen2.5:1.5b-instruct")
     except Exception as e:
-        print(f"\nWARNING: Cannot reach Ollama ({e})")
-        print("Make sure Ollama is installed and running:  ollama serve\n")
+        print(f"  WARNING: Ollama not reachable ({e})")
 
     C.RESULTS.mkdir(parents=True, exist_ok=True)
 
-    # Check for cached baseline
     baseline_cache = C.RESULTS / "baseline" / "summary.json"
     if baseline_cache.exists():
         base = json.loads(baseline_cache.read_text())

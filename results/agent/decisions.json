@@ -2,19 +2,19 @@
   {
     "step": 0,
     "hour": 0.25,
-    "reason": "static phase-1 policy: cool+0 heat+0 precool 0h/-0C peak+0C",
+    "reason": "initial policy: unoccupied setback + precool before evening peak",
     "policy": {
       "cooling_offset": 0.0,
       "heating_offset": 0.0,
       "unocc_cooling_offset": 0.5,
-      "unocc_heating_offset": 0.0,
-      "precool_hours": 0.0,
-      "precool_depth": 0.0,
+      "unocc_heating_offset": -0.5,
+      "precool_hours": 2.0,
+      "precool_depth": 0.5,
       "peak_start": 17,
       "peak_end": 21,
-      "peak_offset": 0.0,
+      "peak_offset": 0.5,
       "zones": null,
-      "reason": "static phase-1 policy: cool+0 heat+0 precool 0h/-0C peak+0C",
+      "reason": "initial policy: unoccupied setback + precool before evening peak",
       "issued_at": ""
     }
   }
