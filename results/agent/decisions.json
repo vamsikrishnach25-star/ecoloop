@@ -19,9 +19,9 @@
     }
   },
   {
-    "step": 898,
-    "hour": 8.75,
-    "reason": "High carbon emissions, prioritize reducing peak load by precooling during off-peak hours.",
+    "step": 515,
+    "hour": 9.0,
+    "reason": "High carbon emissions during peak hours, reducing cooling offset to prioritize energy savings.",
     "policy": {
       "cooling_offset": 0.5,
       "heating_offset": 0.0,
@@ -33,7 +33,7 @@
       "peak_end": 21,
       "peak_offset": 0.0,
       "zones": null,
-      "reason": "High carbon emissions, prioritize reducing peak load by precooling during off-peak hours.",
+      "reason": "High carbon emissions during peak hours, reducing cooling offset to prioritize energy savings.",
       "issued_at": ""
     }
   }
